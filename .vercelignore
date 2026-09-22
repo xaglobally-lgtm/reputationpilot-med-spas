@@ -1,0 +1,4 @@
+# Excludes the Express backend from Vercel's build context.
+# Backend deploys separately on Render - Vercel should only see frontend/.
+backend/
+supabase/
