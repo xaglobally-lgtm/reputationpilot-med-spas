@@ -1,0 +1,71 @@
+{
+  "services": [
+    {
+      "type": "web",
+      "name": "reputationpilot-med-spas-backend",
+      "runtime": "node",
+      "runtimeVersion": "20",
+      "buildCommand": "cd backend && npm install && npm run build",
+      "startCommand": "node dist/server.js",
+      "preDeployCommand": "npm run migrate",
+      "envVars": [
+        {
+          "key": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "key": "PORT",
+          "value": "3000"
+        },
+        {
+          "key": "LOG_LEVEL",
+          "value": "info"
+        }
+      ],
+      "envVarGroups": [
+        {
+          "name": "secrets",
+          "envVars": [
+            {
+              "key": "SUPABASE_URL",
+              "fromDatabase": {
+                "name": "app_secrets",
+                "property": "SUPABASE_URL"
+              }
+            },
+            {
+              "key": "SUPABASE_SERVICE_ROLE_KEY",
+              "fromDatabase": {
+                "name": "app_secrets",
+                "property": "SUPABASE_SERVICE_ROLE_KEY"
+              }
+            },
+            {
+              "key": "API_ADMIN_KEY",
+              "fromDatabase": {
+                "name": "app_secrets",
+                "property": "API_ADMIN_KEY"
+              }
+            },
+            {
+              "key": "ALLOWED_ORIGINS",
+              "fromDatabase": {
+                "name": "app_secrets",
+                "property": "ALLOWED_ORIGINS"
+              }
+            }
+          ]
+        }
+      ],
+      "scaling": {
+        "minInstances": 1,
+        "maxInstances": 3,
+        "targetCPUUtilization": 70,
+        "targetMemoryUtilization": 80
+      },
+      "healthCheckPath": "/health",
+      "healthCheckTimeout": 10,
+      "regions": ["oregon"]
+    }
+  ]
+}
