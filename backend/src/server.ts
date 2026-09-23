@@ -224,7 +224,7 @@ app.get('/health', async (req: Request, res: Response) => {
       status: healthResult.status,
       response_time_ms: dbResponseTime,
       metadata: { uptime: process.uptime() },
-    }).catch(err => log('WARN', 'Failed to log health check', err));
+    }).then(null, (err) => log('WARN', 'Failed to log health check', err));
 
   } catch (err) {
     log('ERROR', 'Health check failed', err);
@@ -294,7 +294,7 @@ app.use((err: any, req: Request, res: Response, next: NextFunction) => {
       body: req.body,
     },
     severity: 'error',
-  }).catch(dbErr => log('WARN', 'Failed to log error to database', dbErr));
+  }).then(null, (dbErr) => log('WARN', 'Failed to log error to database', dbErr));
 
   // Send alert email
   sendErrorAlert(message, {
