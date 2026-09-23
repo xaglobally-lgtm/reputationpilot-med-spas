@@ -1,6 +1,6 @@
 {
-  "buildCommand": "cd frontend && npm install && npm run build",
-  "outputDirectory": "frontend/dist",
+  "buildCommand": "npm install && npm run build",
+  "outputDirectory": "dist",
   "framework": "vite",
   "cleanUrls": true,
   "trailingSlash": false,
@@ -52,12 +52,5 @@
       "destination": "/health.html",
       "permanent": false
     }
-  ],
-  "env": {
-    "VITE_API_URL": "@api_url",
-    "VITE_SUPABASE_URL": "@supabase_url",
-    "VITE_SUPABASE_ANON_KEY": "@supabase_anon_key",
-    "VITE_APP_NAME": "@app_name",
-    "VITE_ENVIRONMENT": "@environment"
-  }
+  ]
 }
