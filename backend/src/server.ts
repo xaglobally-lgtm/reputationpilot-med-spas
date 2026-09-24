@@ -51,7 +51,7 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const API_ADMIN_KEY = process.env.API_ADMIN_KEY!;
-const ADMIN_PIN = process.env.API_ADMIN_PIN || '1234';
+const ADMIN_PIN = process.env.API_ADMIN_PIN || ''; // no PIN set = admin access disabled
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173').split(',');
 const ERROR_ALERT_EMAIL = process.env.ERROR_ALERT_EMAIL || 'xaglobally@gmail.com';
 
@@ -130,7 +130,7 @@ app.use(cors({
   origin: ALLOWED_ORIGINS,
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-API-Key', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'X-API-Key', 'X-Admin-PIN', 'Authorization'],
 }));
 
 // Security headers
@@ -155,39 +155,71 @@ app.use(limiter);
 
 // ---- AUTHENTICATION MIDDLEWARE ----
 
-app.use((req: AuthRequest, res: Response, next: NextFunction) => {
-  const apiKey = req.headers['x-api-key'] as string;
-  const authHeader = req.headers['authorization'] as string;
-
-  // Skip auth for health check
-  if (req.path === '/health') {
-    return next();
+// Timing-safe string comparison (avoids leaking key contents through response timing).
+const safeEqual = (a?: string, b?: string): boolean => {
+  if (!a || !b) return false;
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+// Only a SHA-256 fingerprint of each API key is stored; the key itself is shown once at creation.
+const hashKey = (k: string): string => crypto.createHash('sha256').update(k).digest('hex');
+const keyCache = new Map<string, { ok: boolean; id?: string; at: number }>();
+async function lookupApiKey(key: string): Promise<{ ok: boolean; id?: string }> {
+  const h = hashKey(key);
+  const cached = keyCache.get(h);
+  if (cached && Date.now() - cached.at < 60_000) return cached;
+  const { data, error } = await supabase
+    .from('xag_api_keys')
+    .select('id, expires_at')
+    .eq('app', APP_NAME)
+    .eq('key_hash', h)
+    .eq('active', true)
+    .maybeSingle();
+  const ok = !error && !!data && (!data.expires_at || new Date(data.expires_at) > new Date());
+  const result = { ok, id: data?.id as string | undefined, at: Date.now() };
+  keyCache.set(h, result);
+  if (ok && data) {
+    supabase.from('xag_api_keys').update({ last_used_at: new Date().toISOString() }).eq('id', data.id)
+      .then(null, (e) => log('WARN', 'Failed to record key use', e));
   }
+  return result;
+}
 
-  // Check admin key (with optional PIN)
-  if (apiKey === API_ADMIN_KEY) {
-    const pin = req.headers['x-admin-pin'] as string;
-    if (pin === ADMIN_PIN) {
-      req.isAdmin = true;
-      return next();
+app.use(async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    // Health check is public
+    if (req.path === '/health') return next();
+
+    const apiKey = req.headers['x-api-key'] as string | undefined;
+    const authHeader = req.headers['authorization'] as string | undefined;
+
+    // Admin: admin key AND matching PIN (both generated per service by Render)
+    if (apiKey && safeEqual(apiKey, API_ADMIN_KEY)) {
+      if (ADMIN_PIN && safeEqual(req.headers['x-admin-pin'] as string | undefined, ADMIN_PIN)) {
+        req.isAdmin = true;
+        return next();
+      }
+      return res.status(401).json({ error: 'Admin requests need a valid X-Admin-PIN header.' });
     }
-  }
 
-  // Check API key from database (TODO: implement when Prisma is ready)
-  // For now, accept any X-API-Key for demo
-  if (apiKey) {
-    req.userId = 'user-from-api-key'; // Placeholder
-    return next();
-  }
+    // Customer API key: must exist, be active, unexpired, and belong to this app
+    if (apiKey) {
+      const r = await lookupApiKey(apiKey);
+      if (r.ok) { req.userId = `key:${r.id}`; return next(); }
+      return res.status(401).json({ error: 'Invalid, revoked or expired API key.' });
+    }
 
-  // Check bearer token
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7);
-    req.userId = 'user-from-token'; // Placeholder
-    return next();
-  }
+    // Signed-in user: verify the Supabase access token
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const { data, error } = await supabase.auth.getUser(authHeader.slice(7));
+      if (!error && data.user) { req.userId = data.user.id; return next(); }
+      return res.status(401).json({ error: 'Invalid or expired sign-in token.' });
+    }
 
-  res.status(401).json({ error: 'Unauthorized. Provide X-API-Key or Authorization header.' });
+    res.status(401).json({ error: 'Unauthorized. Provide X-API-Key or Authorization header.' });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---- ROUTES ----
@@ -266,6 +298,56 @@ app.post('/api/echo', async (req: AuthRequest, res: Response) => {
     log('ERROR', 'Echo endpoint error', err);
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ---- API KEY MANAGEMENT (admin only) ----
+
+const requireAdmin = (req: AuthRequest, res: Response, next: NextFunction) =>
+  req.isAdmin ? next() : res.status(403).json({ error: 'Admin only.' });
+
+// Create a key. The full key is returned ONCE; only its fingerprint is stored.
+app.post('/api/admin/keys', requireAdmin, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const label = String(req.body?.label ?? '').slice(0, 100) || null;
+    const expires_at = req.body?.expires_at ? new Date(req.body.expires_at).toISOString() : null;
+    const key = `xag_${crypto.randomBytes(24).toString('base64url')}`;
+    const { data, error } = await supabase
+      .from('xag_api_keys')
+      .insert({ app: APP_NAME, label, key_prefix: key.slice(0, 10), key_hash: hashKey(key), expires_at })
+      .select('id, label, key_prefix, created_at, expires_at')
+      .single();
+    if (error) throw error;
+    res.status(201).json({ ...data, key, note: 'Store this key now. It cannot be shown again.' });
+  } catch (err) { next(err); }
+});
+
+// List keys (never returns the keys themselves)
+app.get('/api/admin/keys', requireAdmin, async (_req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { data, error } = await supabase
+      .from('xag_api_keys')
+      .select('id, label, key_prefix, active, created_at, last_used_at, expires_at')
+      .eq('app', APP_NAME)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json({ keys: data });
+  } catch (err) { next(err); }
+});
+
+// Revoke a key
+app.delete('/api/admin/keys/:id', requireAdmin, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { data, error } = await supabase
+      .from('xag_api_keys')
+      .update({ active: false })
+      .eq('id', req.params.id)
+      .eq('app', APP_NAME)
+      .select('id');
+    if (error) throw error;
+    keyCache.clear();
+    if (!data || !data.length) return res.status(404).json({ error: 'Key not found.' });
+    res.json({ revoked: req.params.id });
+  } catch (err) { next(err); }
 });
 
 // ---- ERROR HANDLING ----

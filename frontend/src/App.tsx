@@ -70,14 +70,15 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const response = await axios.get<ApiTestResult>(`${API_URL}/api/test`, {
-        headers: {
-          'X-API-Key': 'test-key',
-        },
-      });
+      // No key is sent: a public page must never contain one. A 401 proves the API is protected.
+      const response = await axios.get<ApiTestResult>(`${API_URL}/api/test`);
       setTestResult(response.data);
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err));
+      if (axios.isAxiosError(err) && err.response?.status === 401) {
+        setError('API is protected: it only answers requests that carry a valid API key or sign-in. This is expected.');
+      } else {
+        setError(String(err instanceof Error ? err.message : err));
+      }
     } finally {
       setLoading(false);
     }
