@@ -184,7 +184,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     if (ms >= SLOW_MS && req.path !== '/client-errors' && !throttled(`slow:${req.method}:${req.path}`, 10 * 60_000)) {
       recordError({ error_code: 'SLOW_RESPONSE', message: `${req.method} ${req.path} took ${ms} ms`, severity: 'warning', context: { ms, status: res.statusCode } });
     }
-    if (res.statusCode === 401 && !throttled('auth401', 60_000)) {
+    // Hosting start-up probes (HEAD / or GET /) are not login attempts: don't log them.
+    if (res.statusCode === 401 && req.method !== 'HEAD' && req.path !== '/' && !throttled('auth401', 60_000)) {
       recordError({ error_code: 'AUTH_FAILED', message: `Rejected ${req.method} ${req.path}: missing or invalid key/token`, severity: 'info', context: { path: req.path } });
     }
   });
@@ -207,6 +208,11 @@ app.post('/client-errors', clientErrorLimiter, (req: Request, res: Response) => 
     });
   }
   res.status(204).end();
+});
+
+// Public front door: answers hosting probes and curious visitors without needing a key.
+app.all('/', (_req: Request, res: Response) => {
+  res.json({ app: APP_NAME, status: 'ok', health: '/health' });
 });
 
 // ---- AUTHENTICATION MIDDLEWARE ----
