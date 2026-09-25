@@ -294,7 +294,7 @@ app.get('/health', async (req: Request, res: Response) => {
     // Test database connection
     const { data, error } = await supabase
       .from('app_users')
-      .select('count()', { count: 'exact', head: true });
+      .select('id', { count: 'exact', head: true }); // plain count; aggregate count() is not enabled on this database
 
     const dbResponseTime = Date.now() - startTime;
     const dbStatus = error ? 'error' : 'connected';
@@ -312,8 +312,8 @@ app.get('/health', async (req: Request, res: Response) => {
 
     res.status(200).json(healthResult);
 
-    // Log to database (async, don't wait)
-    supabase.from('app_health_checks').insert({
+    // Log to database at most every 10 minutes (hosting pings /health every few seconds)
+    if (!throttled('healthlog', 10 * 60_000)) supabase.from('app_health_checks').insert({
       app: APP_NAME,
       service: 'backend',
       status: healthResult.status,
