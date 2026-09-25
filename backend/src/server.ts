@@ -153,6 +153,62 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
+// ---- TELEMETRY (errors, slow responses, browser errors -> Planet of the Apps) ----
+
+const SLOW_MS = Number(process.env.SLOW_RESPONSE_MS) || 3000;
+const lastReported = new Map<string, number>();
+// true = already reported recently (skip); keeps noisy problems from flooding the database
+function throttled(key: string, everyMs: number): boolean {
+  const now = Date.now();
+  if (now - (lastReported.get(key) || 0) < everyMs) return true;
+  if (lastReported.size > 2000) lastReported.clear();
+  lastReported.set(key, now);
+  return false;
+}
+function recordError(row: { error_code: string; message: string; stack_trace?: string | null; context?: Record<string, unknown>; severity?: string }) {
+  supabase.from('app_errors').insert({
+    app: APP_NAME,
+    severity: row.severity || 'error',
+    error_code: row.error_code,
+    message: String(row.message).slice(0, 1000),
+    stack_trace: row.stack_trace ? String(row.stack_trace).slice(0, 4000) : null,
+    context: row.context || {},
+  }).then(null, (dbErr) => log('WARN', 'Failed to log error to database', dbErr));
+}
+
+// Slow responses and rejected logins (both throttled)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const t0 = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - t0;
+    if (ms >= SLOW_MS && req.path !== '/client-errors' && !throttled(`slow:${req.method}:${req.path}`, 10 * 60_000)) {
+      recordError({ error_code: 'SLOW_RESPONSE', message: `${req.method} ${req.path} took ${ms} ms`, severity: 'warning', context: { ms, status: res.statusCode } });
+    }
+    if (res.statusCode === 401 && !throttled('auth401', 60_000)) {
+      recordError({ error_code: 'AUTH_FAILED', message: `Rejected ${req.method} ${req.path}: missing or invalid key/token`, severity: 'info', context: { path: req.path } });
+    }
+  });
+  next();
+});
+
+// Browser error reports from this app's own website (public, rate-limited, no personal data kept)
+const CLIENT_KINDS: Record<string, string> = { js: 'JS_ERROR', promise: 'JS_UNHANDLED_REJECTION', api: 'API_CALL_FAILED', network: 'NETWORK_ERROR' };
+const clientErrorLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, standardHeaders: false });
+app.post('/client-errors', clientErrorLimiter, (req: Request, res: Response) => {
+  const b = (req.body && typeof req.body === 'object') ? req.body : {};
+  const clip = (v: unknown, n: number) => (v == null || v === '' ? null : String(v).slice(0, n));
+  const kind = Object.prototype.hasOwnProperty.call(CLIENT_KINDS, String(b.kind)) ? String(b.kind) : 'js';
+  const message = clip(b.message, 500);
+  if (!message) return res.status(400).json({ error: 'message required' });
+  if (!throttled(`client:${kind}:${message}`, 5000)) {
+    recordError({
+      error_code: CLIENT_KINDS[kind], message, stack_trace: clip(b.stack, 3000), severity: 'error',
+      context: { source: 'browser', page: clip(b.page, 300), api: clip(b.api, 300), status: Number(b.status) || null, userAgent: clip(req.headers['user-agent'], 200) },
+    });
+  }
+  res.status(204).end();
+});
+
 // ---- AUTHENTICATION MIDDLEWARE ----
 
 // Timing-safe string comparison (avoids leaking key contents through response timing).
@@ -252,6 +308,7 @@ app.get('/health', async (req: Request, res: Response) => {
 
     // Log to database (async, don't wait)
     supabase.from('app_health_checks').insert({
+      app: APP_NAME,
       service: 'backend',
       status: healthResult.status,
       response_time_ms: dbResponseTime,
@@ -355,28 +412,29 @@ app.delete('/api/admin/keys/:id', requireAdmin, async (req: AuthRequest, res: Re
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
   const errorId = crypto.randomUUID();
   const message = err.message || 'Internal server error';
+
+  // Client mistakes (malformed JSON, oversized body, ...) are not server failures: answer 4xx, don't raise an alert.
+  const clientStatus = Number(err.status || err.statusCode);
+  if (clientStatus >= 400 && clientStatus < 500) {
+    return res.status(clientStatus).json({ error: err.expose ? message : 'Bad request', errorId });
+  }
   
+  // Request bodies are deliberately NOT logged: they can contain passwords or personal data.
   log('ERROR', `[${errorId}] Unhandled error`, {
     message,
     stack: err.stack,
-    url: req.url,
+    url: req.path,
     method: req.method,
-    body: req.body,
   });
 
-  // Save to database
-  supabase.from('app_errors').insert({
+  // Save to database (stamped with this app's name so Planet can attribute it)
+  recordError({
     error_code: err.code || 'UNKNOWN',
     message,
     stack_trace: err.stack,
-    context: {
-      errorId,
-      url: req.url,
-      method: req.method,
-      body: req.body,
-    },
+    context: { errorId, path: req.path, method: req.method },
     severity: 'error',
-  }).then(null, (dbErr) => log('WARN', 'Failed to log error to database', dbErr));
+  });
 
   // Send alert email
   sendErrorAlert(message, {
